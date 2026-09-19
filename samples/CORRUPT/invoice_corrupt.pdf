@@ -1,0 +1,2 @@
+This file is intentionally truncated/corrupted.
+The invoice pipeline should fail gracefully and record an error without crashing the worker.

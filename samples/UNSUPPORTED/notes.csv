@@ -1,0 +1,2 @@
+This file intentionally has an unsupported extension for monitor rejection tests.
+The monitor should log an unsupported event and skip processing.
