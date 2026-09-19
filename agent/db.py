@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import os
 from typing import Any
 
 import psycopg
@@ -121,3 +123,75 @@ def save_parsed(invoice_id: str, invoice: dict, line_items: list[dict]) -> None:
                         line.get("line_total"),
                     ),
                 )
+
+
+def save_validation(invoice_id: str, run: int, source: str, discrepancies: list[dict]) -> None:
+    if invoice_id is None:
+        return
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE audit.invoice_audit SET validation_run = %s, validation_status = %s WHERE invoice_id = %s",
+                (run, "failed" if discrepancies else "passed", invoice_id),
+            )
+            for item in discrepancies:
+                cur.execute(
+                    """
+                        INSERT INTO audit.discrepancies (
+                            invoice_id, source, line_number, field_name, invoice_value, expected_value,
+                            deviation_pct, severity, message, validation_run
+                        )
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        invoice_id,
+                        item.get("source", source),
+                        item.get("line_number"),
+                        item.get("field_name"),
+                        item.get("invoice_value"),
+                        item.get("expected_value"),
+                        item.get("deviation_pct"),
+                        item.get("severity"),
+                        item.get("message"),
+                        run,
+                    ),
+                )
+
+
+def write_report_files(invoice_id: str, report_json: dict, report_html: str, report_dir: str = "/data/reports") -> None:
+    os.makedirs(report_dir, exist_ok=True)
+    base_path = os.path.join(report_dir, str(invoice_id))
+    json_path = f"{base_path}.json"
+    html_path = f"{base_path}.html"
+
+    temp_json_path = f"{json_path}.tmp"
+    temp_html_path = f"{html_path}.tmp"
+
+    with open(temp_json_path, "w", encoding="utf-8") as handle:
+        json.dump(report_json, handle, ensure_ascii=False, indent=2, default=str)
+    os.replace(temp_json_path, json_path)
+
+    with open(temp_html_path, "w", encoding="utf-8") as handle:
+        handle.write(report_html)
+    os.replace(temp_html_path, html_path)
+
+
+def save_report(invoice_id: str, report_json: dict, report_html: str, recommendation: str, validation_status: str) -> None:
+    if invoice_id is None:
+        return
+    write_report_files(invoice_id, report_json, report_html)
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                    UPDATE audit.invoice_audit
+                    SET report_json = %s,
+                        report_html = %s,
+                        recommendation = %s,
+                        validation_status = %s,
+                        processing_status = 'completed',
+                        processed_at = NOW()
+                    WHERE invoice_id = %s
+                """,
+                (report_json, report_html, recommendation, validation_status, invoice_id),
+            )
