@@ -31,3 +31,33 @@ def claim_invoice(file_path: str, name: str, file_type: str, checksum: str) -> s
             if row is None:
                 return None
             return str(row[0])
+
+
+def log_file_event(invoice_id: str | None, file_path: str, file_checksum: str, event: str, detail: str | None = None) -> None:
+    sql = """
+        INSERT INTO audit.file_events (invoice_id, file_path, file_checksum, event, detail)
+        VALUES (%s, %s, %s, %s, %s)
+    """
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, (invoice_id, file_path, file_checksum, event, detail))
+
+
+def set_status(invoice_id: str | None, processing_status: str) -> None:
+    if invoice_id is None:
+        return
+    sql = "UPDATE audit.invoice_audit SET processing_status = %s, processed_at = NOW() WHERE invoice_id = %s"
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, (processing_status, invoice_id))
+
+
+def mark_error(invoice_id: str | None, error_message: str, detail: str | None = None) -> None:
+    if invoice_id is None:
+        return
+    sql = "UPDATE audit.invoice_audit SET processing_status = 'error', error_message = %s WHERE invoice_id = %s"
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, (error_message, invoice_id))
+    if detail:
+        log_file_event(invoice_id, detail, "", "error", error_message)

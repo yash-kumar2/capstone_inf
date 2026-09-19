@@ -8,3 +8,7 @@
 - Base PostgreSQL, Redis, and Qdrant compose configuration
 - Initial database schema files and dev ERP stand-in
 - Core agent settings and database contract scaffolding
+
+### Changed
+- Added the commit 2 scope: file monitor, Redis/LLM cache utilities, and mock ERP service container
+- Added a minimal PostgresSaver graph bootstrap and document updates for the second milestone

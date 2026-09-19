@@ -56,6 +56,27 @@ services:
     networks:
       - invoice-net
 
+  mock-erp:
+    build:
+      context: ./mock-erp
+    image: invoice-mock-erp:1.0
+    container_name: invoice-mock-erp
+    env_file:
+      - .env
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8001:8000"
+    restart: on-failure:3
+    networks:
+      - invoice-net
+
 volumes:
   pgdata:
   qdrant_data:
