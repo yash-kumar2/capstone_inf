@@ -19,6 +19,10 @@ This milestone adds the file intake monitor, Redis/LLM cache foundations, and th
 
 This milestone adds extraction for PDF, DOCX, and PNG files, the agent and Streamlit container images, and the internal invoice validation logic using Decimal-based arithmetic checks.
 
+## Commit 4
+
+This milestone adds language detection, translation to English, deterministic invoice parsing, and ERP-side business validation for PO, vendor, currency, and line-item comparisons.
+
 ## Getting started
 
 1. Copy `.env.example` to `.env` and fill in values.

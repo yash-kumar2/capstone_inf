@@ -13,3 +13,4 @@
 - Added the commit 2 scope: file monitor, Redis/LLM cache utilities, and mock ERP service container
 - Added a minimal PostgresSaver graph bootstrap and document updates for the second milestone
 - Added the commit 3 scope: OCR/PDF/DOCX/PNG extraction utilities, agent and Streamlit Dockerfiles, and invoice validation logic
+- Added the commit 4 scope: language detection, translation, invoice parsing, and ERP business validation

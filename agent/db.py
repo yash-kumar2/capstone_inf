@@ -61,3 +61,63 @@ def mark_error(invoice_id: str | None, error_message: str, detail: str | None = 
             cur.execute(sql, (error_message, invoice_id))
     if detail:
         log_file_event(invoice_id, detail, "", "error", error_message)
+
+
+def save_translation(invoice_id: str, source_language: str, translated_text: str, translation_confidence: float) -> None:
+    sql = """
+        UPDATE audit.invoice_audit
+        SET source_language = %s, translated_text = %s, translation_confidence = %s
+        WHERE invoice_id = %s
+    """
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, (source_language, translated_text, translation_confidence, invoice_id))
+
+
+def save_parsed(invoice_id: str, invoice: dict, line_items: list[dict]) -> None:
+    sql = """
+        UPDATE audit.invoice_audit
+        SET invoice_number = %s,
+            invoice_date = %s,
+            vendor_name = %s,
+            po_number = %s,
+            currency = %s,
+            subtotal = %s,
+            tax_amount = %s,
+            total_amount = %s,
+            processing_status = 'parsed'
+        WHERE invoice_id = %s
+    """
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                sql,
+                (
+                    invoice.get("invoice_number"),
+                    invoice.get("invoice_date"),
+                    invoice.get("vendor_name"),
+                    invoice.get("po_number"),
+                    invoice.get("currency"),
+                    invoice.get("subtotal"),
+                    invoice.get("tax_amount"),
+                    invoice.get("total_amount"),
+                    invoice_id,
+                ),
+            )
+            cur.execute("DELETE FROM audit.invoice_line_items WHERE invoice_id = %s", (invoice_id,))
+            for line in line_items:
+                cur.execute(
+                    """
+                        INSERT INTO audit.invoice_line_items (invoice_id, line_number, item_code, description, quantity, unit_price, line_total)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        invoice_id,
+                        line.get("line_number"),
+                        line.get("item_code"),
+                        line.get("description"),
+                        line.get("quantity"),
+                        line.get("unit_price"),
+                        line.get("line_total"),
+                    ),
+                )
