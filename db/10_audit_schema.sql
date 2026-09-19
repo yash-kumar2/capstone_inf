@@ -66,9 +66,48 @@ CREATE TABLE IF NOT EXISTS audit.file_events (
         FOREIGN KEY (invoice_id) REFERENCES audit.invoice_audit (invoice_id) ON DELETE SET NULL
 );
 
+CREATE TABLE IF NOT EXISTS audit.human_feedback (
+    id SERIAL PRIMARY KEY,
+    invoice_id UUID NOT NULL,
+    field_name VARCHAR(128) NOT NULL,
+    original_value TEXT,
+    corrected_value TEXT,
+    corrected_by VARCHAR(255) NOT NULL,
+    corrected_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    revalidated BOOLEAN NOT NULL DEFAULT false,
+    CONSTRAINT fk_human_feedback_invoice
+        FOREIGN KEY (invoice_id) REFERENCES audit.invoice_audit (invoice_id) ON DELETE CASCADE
+);
+
+CREATE OR REPLACE FUNCTION audit.block_human_feedback_mutation()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        RAISE EXCEPTION 'Deleting human feedback rows is forbidden; insert-only history is required.';
+    ELSIF TG_OP = 'UPDATE' THEN
+        IF NEW.invoice_id = OLD.invoice_id
+           AND NEW.field_name = OLD.field_name
+           AND NEW.original_value = OLD.original_value
+           AND NEW.corrected_by = OLD.corrected_by
+           AND NEW.corrected_value = OLD.corrected_value
+           AND NEW.revalidated IS DISTINCT FROM OLD.revalidated THEN
+            RETURN NEW;
+        END IF;
+        RAISE EXCEPTION 'Human feedback updates are forbidden except for revalidated flag changes.';
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_block_human_feedback_mutation ON audit.human_feedback;
+CREATE TRIGGER trg_block_human_feedback_mutation
+BEFORE DELETE OR UPDATE ON audit.human_feedback
+FOR EACH ROW EXECUTE FUNCTION audit.block_human_feedback_mutation();
+
 CREATE INDEX IF NOT EXISTS idx_invoice_audit_vendor_name ON audit.invoice_audit (vendor_name);
 CREATE INDEX IF NOT EXISTS idx_invoice_audit_invoice_number ON audit.invoice_audit (invoice_number);
 CREATE INDEX IF NOT EXISTS idx_invoice_audit_invoice_date ON audit.invoice_audit (invoice_date);
 CREATE INDEX IF NOT EXISTS idx_invoice_audit_validation_status ON audit.invoice_audit (validation_status);
 CREATE INDEX IF NOT EXISTS idx_invoice_audit_processed_at ON audit.invoice_audit (processed_at);
 CREATE INDEX IF NOT EXISTS idx_discrepancies_invoice_id ON audit.discrepancies (invoice_id);
+CREATE INDEX IF NOT EXISTS idx_human_feedback_invoice_id ON audit.human_feedback (invoice_id);

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import os
+import re
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 import psycopg
@@ -123,6 +125,96 @@ def save_parsed(invoice_id: str, invoice: dict, line_items: list[dict]) -> None:
                         line.get("line_total"),
                     ),
                 )
+
+
+def save_feedback(invoice_id: str, field_name: str, original_value: Any, corrected_value: Any, corrected_by: str) -> None:
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                    INSERT INTO audit.human_feedback (invoice_id, field_name, original_value, corrected_value, corrected_by)
+                    VALUES (%s, %s, %s, %s, %s)
+                """,
+                (invoice_id, field_name, str(original_value) if original_value is not None else None, str(corrected_value) if corrected_value is not None else None, corrected_by),
+            )
+
+
+def _coerce_feedback_value(value: Any) -> Any:
+    if value is None or isinstance(value, (bool, int, float, Decimal)):
+        return value
+
+    text = str(value).strip()
+    if text == "":
+        return value
+
+    try:
+        decimal_value = Decimal(text)
+    except InvalidOperation:
+        return value
+
+    if decimal_value == decimal_value.to_integral_value():
+        return int(decimal_value)
+    return float(decimal_value)
+
+
+def get_effective_invoice(invoice: dict[str, Any] | str | None, line_items: list[dict[str, Any]] | None = None, feedback: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    if isinstance(invoice, str):
+        invoice = {"invoice_id": invoice}
+
+    invoice_data = dict(invoice or {})
+    line_items_data = list(line_items or [])
+    feedback_rows = list(feedback or [])
+
+    if not feedback_rows and invoice_data.get("invoice_id"):
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT field_name, original_value, corrected_value, corrected_by, corrected_at
+                    FROM audit.human_feedback
+                    WHERE invoice_id = %s
+                    ORDER BY corrected_at DESC, id DESC
+                    """,
+                    (invoice_data["invoice_id"],),
+                )
+                feedback_rows = [
+                    {
+                        "field_name": row[0],
+                        "original_value": row[1],
+                        "corrected_value": row[2],
+                        "corrected_by": row[3],
+                        "corrected_at": row[4],
+                    }
+                    for row in cur.fetchall()
+                ]
+
+    corrections_by_field: dict[str, Any] = {}
+    for row in feedback_rows:
+        field_name = row.get("field_name")
+        if field_name:
+            corrections_by_field[field_name] = _coerce_feedback_value(row.get("corrected_value"))
+
+    for field_name, corrected_value in corrections_by_field.items():
+        if field_name.startswith("line_items["):
+            continue
+        invoice_data[field_name] = corrected_value
+
+    updated_line_items: list[dict[str, Any]] = []
+    for item in line_items_data:
+        entry = dict(item)
+        for row in feedback_rows:
+            field_name = row.get("field_name")
+            match = re.match(r"line_items\[(\d+)\]\.(.+)", str(field_name or ""))
+            if not match:
+                continue
+            line_number = int(match.group(1))
+            property_name = match.group(2)
+            if int(entry.get("line_number", 0)) == line_number:
+                entry[property_name] = _coerce_feedback_value(row.get("corrected_value"))
+        updated_line_items.append(entry)
+
+    invoice_data["line_items"] = updated_line_items
+    return invoice_data
 
 
 def save_validation(invoice_id: str, run: int, source: str, discrepancies: list[dict]) -> None:
