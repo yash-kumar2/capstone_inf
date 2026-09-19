@@ -14,3 +14,4 @@
 - Added a minimal PostgresSaver graph bootstrap and document updates for the second milestone
 - Added the commit 3 scope: OCR/PDF/DOCX/PNG extraction utilities, agent and Streamlit Dockerfiles, and invoice validation logic
 - Added the commit 4 scope: language detection, translation, invoice parsing, and ERP business validation
+- Hardened the Docker compose stack for health checks, startup validation, and secret checks as part of commit 9

@@ -1,8 +1,15 @@
 from __future__ import annotations
 
+import logging
+import os
+import shutil
 from typing import Any
 
+import httpx
+import psycopg
+import redis
 from fastapi import FastAPI, HTTPException
+from qdrant_client import QdrantClient
 
 from .agents.rag.rag_graph import run_rag_round
 from .agents.rag.router import route_question
@@ -10,7 +17,60 @@ from .agents.rag.sql_answers import answer_sql_question
 from .db import get_effective_invoice, save_feedback
 from .settings import SETTINGS
 
+logging.basicConfig(level=getattr(logging, SETTINGS["LOG_LEVEL"].upper(), logging.INFO), format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger("invoice-agent")
+
 app = FastAPI(title="AI Invoice Auditor Agent")
+
+
+def validate_runtime_dependencies() -> None:
+    missing = []
+    for key in ["MODEL_REASONING", "MODEL_GENERATION", "MODEL_TRANSLATION", "MODEL_EMBEDDING"]:
+        if not SETTINGS.get(key):
+            missing.append(key)
+    if not shutil.which("tesseract"):
+        missing.append("tesseract")
+    if missing:
+        raise RuntimeError(f"Startup validation failed: missing runtime requirements: {', '.join(missing)}")
+
+    try:
+        with psycopg.connect(
+            dbname=SETTINGS["POSTGRES_DB"],
+            user=SETTINGS["POSTGRES_USER"],
+            password=SETTINGS["POSTGRES_PASSWORD"],
+            host=SETTINGS["POSTGRES_HOST"],
+            port=SETTINGS["POSTGRES_PORT"],
+        ) as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1")
+    except Exception as exc:  # pragma: no cover - startup guard
+        raise RuntimeError(f"PostgreSQL startup check failed: {exc}") from exc
+
+    try:
+        redis_client = redis.Redis(host=SETTINGS["REDIS_HOST"], port=SETTINGS["REDIS_PORT"], decode_responses=True)
+        redis_client.ping()
+    except Exception as exc:  # pragma: no cover - startup guard
+        raise RuntimeError(f"Redis startup check failed: {exc}") from exc
+
+    try:
+        qdrant_client = QdrantClient(host=SETTINGS["QDRANT_HOST"], port=SETTINGS["QDRANT_PORT"])
+        qdrant_client.get_collections()
+    except Exception as exc:  # pragma: no cover - startup guard
+        raise RuntimeError(f"Qdrant startup check failed: {exc}") from exc
+
+    try:
+        response = httpx.get(f"{SETTINGS['ERP_BASE_URL']}/health", timeout=5.0)
+        if response.status_code != 200:
+            raise RuntimeError(f"ERP health check returned {response.status_code}")
+    except Exception as exc:  # pragma: no cover - startup guard
+        raise RuntimeError(f"ERP startup check failed: {exc}") from exc
+
+
+@app.on_event("startup")
+def startup_checks() -> None:
+    logger.info("Running startup dependency validation")
+    validate_runtime_dependencies()
+    logger.info("Startup dependency validation passed")
 
 
 @app.get("/health")

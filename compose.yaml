@@ -71,6 +71,12 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import httpx, sys; r = httpx.get('http://127.0.0.1:8000/health', timeout=5.0); sys.exit(0 if r.status_code == 200 else 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
     ports:
       - "8001:8000"
     restart: on-failure:3
@@ -98,7 +104,13 @@ services:
       qdrant:
         condition: service_healthy
       mock-erp:
-        condition: service_started
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import httpx, sys; r = httpx.get('http://127.0.0.1:8000/health', timeout=5.0); sys.exit(0 if r.status_code == 200 else 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
     ports:
       - "8000:8000"
     volumes:
@@ -106,6 +118,7 @@ services:
       - reports_data:/data/reports
       - ./agent/configs:/app/configs:ro
     restart: unless-stopped
+    stop_grace_period: 30s
     networks:
       - invoice-net
 
@@ -123,7 +136,13 @@ services:
       postgres:
         condition: service_healthy
       agent:
-        condition: service_started
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import httpx, sys; r = httpx.get('http://127.0.0.1:8501/_stcore/health', timeout=5.0); sys.exit(0 if r.status_code == 200 else 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 25s
     ports:
       - "8501:8501"
     restart: unless-stopped
