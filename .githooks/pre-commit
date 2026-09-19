@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+set -eu
+
+staged_files=$(git diff --cached --name-only --diff-filter=ACMR)
+
+while IFS= read -r file; do
+  [ -z "$file" ] && continue
+  case "$file" in
+    .env)
+      echo "ERROR: Staging .env files is forbidden. Use .env.example instead." >&2
+      exit 1
+      ;;
+    .env.*)
+      if [ "$file" != ".env.example" ]; then
+        echo "ERROR: Staging .env files is forbidden. Use .env.example instead." >&2
+        exit 1
+      fi
+      ;;
+  esac
+done <<EOF
+$staged_files
+EOF
+
+if printf '%s\n' "$staged_files" | grep -Eq 'AKIA[0-9A-Z]{16}|aws_secret'; then
+  echo "ERROR: Secret patterns detected in staged files." >&2
+  exit 1
+fi
+
+exit 0

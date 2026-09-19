@@ -1,0 +1,45 @@
+required_fields:
+  - invoice_number
+  - invoice_date
+  - vendor_name
+  - currency
+  - total_amount
+
+extraction:
+  min_text_chars_per_page: 40
+
+parsing:
+  date_order: DMY
+  labels:
+    invoice_number: ["invoice no", "invoice #", "inv no"]
+    total: ["grand total", "total due", "total"]
+
+arithmetic:
+  line_total_tolerance_abs: 0.01
+  sum_tolerance_abs: 0.01
+
+tax:
+  required: false
+  default_rate_pct: 18
+  rate_pct_by_currency:
+    EUR: 19
+    INR: 18
+  tolerance_abs: 0.05
+
+erp:
+  unit_price_tolerance_pct: 5
+  quantity_tolerance_pct: 0
+  currency_must_match: true
+  vendor_match:
+    accept: 0.92
+    reject: 0.60
+
+severity:
+  medium_from_pct: 5
+  high_from_pct: 10
+  missing_field: high
+  po_not_found: high
+
+recommendation:
+  reject_if_high_count_gte: 3
+  reject_if_po_not_found: true

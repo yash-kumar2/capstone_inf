@@ -1,0 +1,65 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: invoice-postgres
+    env_file:
+      - .env
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - ./db/00_schemas.sql:/docker-entrypoint-initdb.d/00_schemas.sql:ro
+      - ./db/10_audit_schema.sql:/docker-entrypoint-initdb.d/10_audit_schema.sql:ro
+      - ./db/erp_schema.sql:/docker-entrypoint-initdb.d/20_erp_schema.sql:ro
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+    restart: unless-stopped
+    networks:
+      - invoice-net
+
+  qdrant:
+    image: qdrant/qdrant:v1.13.0
+    container_name: invoice-qdrant
+    ports:
+      - "6333:6333"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/127.0.0.1/6333'" ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+    networks:
+      - invoice-net
+
+  redis:
+    image: redis:7
+    container_name: invoice-redis
+    command: redis-server --save "" --appendonly no
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+    networks:
+      - invoice-net
+
+volumes:
+  pgdata:
+  qdrant_data:
+
+networks:
+  invoice-net:
+    driver: bridge

@@ -1,0 +1,641 @@
+AI Invoice Auditor: 10-Commit Implementation Plan
+Capstone window: 18 to 25 Sep 2026. This plan merges the problem statement (brief) and the Blueprint into one build order.
+
+Every commit advances three parallel tracks. The tracks touch disjoint folders, so they can be built by three people, or interleaved by one, and merged without conflicts.
+
+Track	Scope	Main folders
+A: Ingestion & Persistence	monitor, extraction, translation, parsing, PostgreSQL, Redis, Qdrant writes, volumes	agent/agents/{monitor,extractor,translator,indexer}.py, agent/tools/, agent/db.py, db/
+B: FastAPI & Streamlit	mock-erp service, agent HTTP API, dashboard, and the Dockerfiles for these services	mock-erp/, streamlit-ui/, agent/main.py
+C: Agents & RAG	LangGraph graphs, validators, reporter, RAG agents, prompts, rules	agent/graph.py, agent/agents/{invoice_validator,business_validator,reporter}.py, agent/agents/rag/, agent/configs/
+Every commit description below is self-contained: goal, what it relies on, per-track tasks, and an acceptance test.
+
+1. Decisions and assumptions
+The two source documents disagree in places, and neither is complete. This is how the plan resolves each point. Please confirm the ones marked ❓.
+
+#	Topic	Decision	Why
+D1	Compose filename	compose.yaml	The brief's deliverable list says compose.yaml. The Blueprint says docker-compose.yml. Compose v2 reads either.
+D2	Config path	agent/configs/rules.yaml and persona.yaml, mounted read-only into the container	The brief says configs/. The Blueprint says config/. Mounting lets you tune tolerances without a rebuild.
+D3	When to use Docker	Infra containers from Commit 1. Each app gets its Dockerfile in the commit where it first exists (mock-erp C2, streamlit and agent C3). Hardening in C9.	The Blueprint says "not Docker first", but brief §8.5 says build images one at a time. Finding network and permission bugs early is cheaper.
+D4	Order of parse and translate	Extractor outputs raw text only. Translation runs next. Then parse_fields() runs on the English text.	This matches brief §5.1 (step 5 comes after step 4). The Blueprint puts parsed fields in the extractor's output.
+D5	LLM use (brief §7.3 says validators use an LLM)	Verdicts stay deterministic (Decimal math). The LLM only does two narrow, cached assists: (a) repair a missing required field, accepted only if the value literally appears in the text; (b) vendor-name adjudication when fuzzy similarity is ambiguous. The Reporter uses the LLM for the narrative.	LLMs are unreliable at arithmetic. Every LLM call is optional and fails safe.
+D6	Tolerance semantics	A mismatch is recorded only if its deviation is greater than the tolerance. Deviation is abs(invoice - erp) / erp * 100.	The brief says "flag beyond tolerance". The Blueprint example flags 4.17% against a 5% tolerance, which is inconsistent.
+D7	Recommendation and re-validation	The brief marks both "need not be implemented". The recommendation is a small config-driven rule (about 15 lines). Re-validation is an optional Track C item in C8 and is the first thing cut.	The column exists in the suggested schema and the Blueprint's UI flow expects a button.
+D8	Who writes human_feedback	The agent writes it through POST /feedback. The UI only reads PostgreSQL.	The brief's ownership table says the agent writes audit and the UI reads it.
+D9	Report text for RAG	Add report_json JSONB and report_html TEXT to invoice_audit.	The brief says Qdrant must be rebuildable from PostgreSQL alone, so reports must live in PostgreSQL.
+D10 ❓	Embedding model	Bedrock amazon.titan-embed-text-v2:0 via LiteLLM (1024 dims, set in env).	The stack lists no embedding model. Local models (torch) would blow the 1.5 GB image budget. Confirm this is allowed, or switch to Cohere embed-multilingual.
+D11	Language detection	One cheap Nova Lite call on the first 1,500 characters, cached in Redis.	No extra library, and it copes with noisy invoice text.
+D12	Reranking	Deterministic heuristic (score plus source_type and invoice-number boosts, threshold, dedupe).	No extra model or library. Document the upgrade path (cross-encoder).
+D13	Watching the folder	Poll with os.scandir every 3 s plus a "size and mtime unchanged" stability check.	It needs no watchdog library. inotify is unreliable on Docker Desktop bind mounts.
+D14	Web framework style	Plain def endpoints and threads. No asyncio.	Simpler code and fewer libraries.
+D15	incoming/ mount	Bind mount, read-only. Reports go to a named volume reports_data.	A non-root container cannot write to a host-owned bind mount. See the Check 4 caveat in C9.
+D16	Retry count	"Max retries: 3" means up to 3 re-retrievals after the first attempt, so at most 4 generations.	Ambiguous in the brief. The value is configurable.
+Not visible to me, so the plan is written to adapt:
+
+The dataset. I don't know the exact languages, formats or invoice templates. The OCR language packs and the parser must be fitted to the real files (C3 and C4 start by looking at them).
+The provided erp_schema.sql. Table and column names below are guesses (vendors, purchase_orders, po_line_items, sku_master). Adapt mock-erp/models.py to the real file. C1 includes a stand-in seed for development only.
+Your AWS setup. Check Bedrock model access and region availability for Nova Lite, Command R+ and Titan Embed on day 1 (C2 has a smoke test).
+2. Final repository layout
+ai-invoice-auditor/
+├── agent/                     # build context = this folder; /app inside the container
+│   ├── main.py                # FastAPI: /health, /query, /feedback, /revalidate, /index/stats, /admin/reindex
+│   ├── graph.py               # ingestion StateGraph (+ PostgresSaver on schema "langgraph")
+│   ├── state.py               # InvoiceState TypedDict (contract)
+│   ├── settings.py            # env loading, fail-fast validation
+│   ├── db.py                  # psycopg pool + all audit read/write functions
+│   ├── llm.py                 # LiteLLM wrapper (chat, embed) + Redis cache
+│   ├── cache.py               # Redis get/set with TTL; degrades to "no cache" on failure
+│   ├── agents/
+│   │   ├── monitor.py  extractor.py  translator.py
+│   │   ├── invoice_validator.py  business_validator.py
+│   │   ├── reporter.py  indexer.py
+│   │   └── rag/  router.py  sql_answers.py  retrieval.py  augmentation.py
+│   │             generation.py  reflection.py  rag_graph.py
+│   ├── tools/  erp_tools.py  extraction_tools.py  embedding_tools.py
+│   ├── configs/  rules.yaml  persona.yaml
+│   ├── tests/
+│   ├── requirements.txt  requirements-dev.txt
+│   ├── Dockerfile  .dockerignore
+├── mock-erp/  main.py  models.py  db.py  tests/  requirements.txt  Dockerfile  .dockerignore
+├── streamlit-ui/  app.py  requirements.txt  Dockerfile  .dockerignore
+├── db/  00_schemas.sql  10_audit_schema.sql  erp_schema.sql  dev/erp_standin.sql
+├── samples/                   # test invoices (pdf/docx/png; en/es/de/fr; duplicate; corrupt)
+├── scripts/                   # smoke_llm.py  check_*.sh  verify_all.sh  scan_secrets.sh
+├── docs/                      # ARCHITECTURE.md, DEMO.md, VIVA.md, slides outline
+├── incoming/   .githooks/pre-commit
+├── compose.yaml  .env.example  .gitignore  README.md  CHANGELOG.md
+Inside the containers, imports are top-level (from state import InvoiceState). Run natively with cd agent && uvicorn main:app.
+
+3. Frozen contracts (built in Commit 1, then never broken)
+3.1 InvoiceState (LangGraph state)
+Money is carried as strings in state and converted to Decimal at the point of computation. This keeps checkpoint serialisation predictable.
+
+class InvoiceState(TypedDict, total=False):
+    invoice_id: str; thread_id: str
+    file_path: str; file_name: str; file_type: str      # pdf | docx | png
+    file_checksum: str
+    raw_extracted_text: str; extraction_method: str     # pdfplumber | docx | tesseract
+    source_language: str; translated_text: str; translation_confidence: float
+    invoice: dict          # invoice_number, invoice_date(ISO), vendor_name, po_number, currency,
+                           # subtotal, tax_amount, total_amount, extras{}
+    line_items: list[dict] # line_number, item_code, description, quantity, unit_price, line_total
+    internal_validation: dict   # {status, discrepancies[], missing_fields[]}
+    erp_validation: dict        # {status, discrepancies[], erp_errors[]}
+    validation_status: str      # passed | failed | partial
+    report: dict; recommendation: str
+    duplicate: bool; error: str | None
+3.2 Discrepancy (produced identically by both validators)
+{"source":"internal|erp","line_number":null,"field_name":"unit_price",
+ "invoice_value":"500","expected_value":"480","deviation_pct":4.1667,
+ "severity":"low|medium|high","message":"Unit price is 4.17% above PO"}
+3.3 mock-erp HTTP API (container port 8000)
+Endpoint	200 body	404
+GET /health	{"status":"ok"}, runs SELECT 1	n/a
+GET /vendor/{vendor_id}	{vendor_id, name, currency, status}	{"detail":"vendor not found"}
+GET /po/{po_number}	{po_number, vendor_id, currency, status, line_items:[{line_number, sku, description, quantity, unit_price}]}	same shape
+GET /sku/{sku_code}	{sku, description, uom, list_price, currency, active}	same shape
+The agent parses ERP JSON with resp.json(parse_float=Decimal). A 404 means "not in ERP" and becomes a discrepancy. Any 5xx or connection error raises ErpUnavailable, which fails the invoice with error. It never becomes a fake discrepancy.
+
+3.4 Audit schema: deltas from the brief's suggested DDL
+The suggested schema is a starting point, and these are the adaptations.
+
+invoice_audit, added columns:
+file_name VARCHAR(255), file_type VARCHAR(8)
+processing_status VARCHAR(16) NOT NULL DEFAULT 'detected' (detected, extracted, translated, parsed, completed, error)
+error_message TEXT
+subtotal NUMERIC(14,2), tax_amount NUMERIC(14,2)
+report_json JSONB, report_html TEXT
+validation_run INT DEFAULT 0
+indexed_at TIMESTAMPTZ, detected_at TIMESTAMPTZ DEFAULT now()
+invoice_line_items: add UNIQUE(invoice_id, line_number).
+discrepancies:
+rename erp_value to expected_value (ERP value when source='erp', computed value when source='internal')
+add source VARCHAR(16), line_number INT, message TEXT, validation_run INT DEFAULT 1
+New audit.file_events(id, file_path, file_checksum, event, detail, at). Events are detected | duplicate | unsupported | error. This satisfies "record every detected file, including failures".
+Indexes on invoice_audit(vendor_name), (invoice_number), (invoice_date), (validation_status), (processed_at), and on discrepancies(invoice_id).
+Keep NUMERIC for money, DATE and TIMESTAMPTZ for dates, JSONB for extracted_raw, and file_checksum UNIQUE.
+3.5 Qdrant
+Collection invoices_rag, cosine distance, size EMBED_DIM.
+
+Payload:
+
+{"invoice_id":"...","chunk_text":"...","source_type":"invoice|report","vendor":"...",
+ "language":"fr|en|...","chunk_index":0,"invoice_number":"..."}
+Keyword payload indexes on invoice_id, source_type, vendor, language.
+
+Point ids are uuid5(NS, f"{invoice_id}:{source_type}:{language}:{chunk_index}"), so upserts are idempotent.
+
+3.6 Redis (disposable)
+Keys are translation:{sha256(source_text)}, lang:{sha256(first_1500_chars)} and llm:{sha256(model+messages+temperature)}, all with a TTL. Start Redis with --save "" --appendonly no and no volume. If Redis is flushed, the system only gets slower.
+
+3.7 Agent HTTP API (port 8000)
+Route	Purpose
+GET /health	Returns 200 only if PostgreSQL, Redis, Qdrant and mock-erp are reachable. Body: {"status","dependencies":{...}}. 503 otherwise.
+POST /query	{question, invoice_id?} returns {answer, mode:"sql|rag", sources[], scores{relevance,groundedness,context_relevance,avg}, attempts, low_confidence}
+POST /feedback	insert-only, see C8
+POST /revalidate/{invoice_id}	optional, see C8
+GET /index/stats	counts by source_type, indexed vs total invoices
+POST /admin/reindex	rebuild Qdrant from PostgreSQL
+3.8 Environment variables (.env.example holds placeholders only)
+Secrets: POSTGRES_PASSWORD, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN (optional)
+Config: POSTGRES_DB, POSTGRES_USER, AWS_REGION_NAME, AWS_DEFAULT_REGION
+Models:
+MODEL_REASONING=bedrock/amazon.nova-lite-v1:0
+MODEL_GENERATION and MODEL_TRANSLATION=bedrock/cohere.command-r-plus-v1:0
+MODEL_EMBEDDING=bedrock/amazon.titan-embed-text-v2:0
+EMBED_DIM=1024
+Check the exact ids for your region. Some regions need inference-profile ids.
+Tuning: OCR_LANGS=eng+spa+deu+fra, MONITOR_POLL_SECONDS=3, RAG_PASS_THRESHOLD=0.7, RAG_MAX_RETRIES=3, CACHE_TTL_SECONDS=604800, LOG_LEVEL=INFO
+Service hosts: these are set in compose.yaml under environment: (POSTGRES_HOST=postgres, REDIS_HOST=redis, QDRANT_HOST=qdrant, ERP_BASE_URL=http://mock-erp:8000, AGENT_URL=http://agent:8000). .env.example documents localhost values for native runs.
+3.9 agent/configs/rules.yaml
+required_fields: [invoice_number, invoice_date, vendor_name, currency, total_amount]
+extraction: {min_text_chars_per_page: 40}
+parsing:
+  date_order: DMY
+  labels: {invoice_number: ["invoice no", "invoice #", "inv no"], total: ["grand total", "total due", "total"], ...}
+arithmetic: {line_total_tolerance_abs: 0.01, sum_tolerance_abs: 0.01}
+tax: {required: false, default_rate_pct: 18, rate_pct_by_currency: {EUR: 19, INR: 18}, tolerance_abs: 0.05}
+erp:
+  unit_price_tolerance_pct: 5
+  quantity_tolerance_pct: 0
+  currency_must_match: true
+  vendor_match: {accept: 0.92, reject: 0.60}
+severity: {medium_from_pct: 5, high_from_pct: 10, missing_field: high, po_not_found: high}
+recommendation: {reject_if_high_count_gte: 3, reject_if_po_not_found: true}
+4. Library budget
+Service	Direct dependencies (pin every version with ==)
+agent	langgraph, langgraph-checkpoint-postgres, psycopg[binary] (with psycopg-pool), litellm, boto3, fastapi, uvicorn, httpx, pdfplumber, pdf2image, pytesseract, pillow, python-docx, qdrant-client, redis, pyyaml
+mock-erp	fastapi, uvicorn, psycopg[binary] (Pydantic comes with FastAPI)
+streamlit-ui	streamlit, psycopg[binary], requests (already a Streamlit dependency)
+dev only (requirements-dev.txt, never in images)	pytest
+Deliberately not used:
+
+langchain proper. langchain-core arrives transitively through LangGraph.
+pandas. st.dataframe takes lists of dicts.
+sqlalchemy. Plain psycopg is enough.
+watchdog. We poll.
+jinja2. HTML reports use str.format and html.escape.
+sentence-transformers and torch. They would break the 1.5 GB budget.
+langdetect. The LLM detects the language.
+tenacity. LiteLLM's num_retries plus a 10-line loop is enough.
+5. Working in parallel
+Commit 1 freezes the contracts. After that, Track A, B and C never wait on each other within a commit, because each builds against the contract with stubs or fixtures.
+Merge recipe: do each track on a short-lived branch (c04-track-a, and so on). Because folders are disjoint, merge them into one integration branch, run the acceptance test, then git merge --squash into main as one commit. Solo, work track by track and stage with git add -p.
+Commit message format: type(scope): subject. Put the three track summaries in the body, and tag milestones v0.1 through v1.0.
+Definition of done for every commit:
+pytest is green.
+docker compose up -d --build reaches all-healthy.
+scripts/scan_secrets.sh (or the pre-commit hook) is clean.
+README and CHANGELOG are updated.
+6. Suggested schedule
+Day	Commits
+Sat 19 Sep	C1, C2 (and run the Bedrock smoke test)
+Sun 20 Sep	C3
+Mon 21 Sep	C4, C5 (the E2E pipeline works)
+Tue 22 Sep	C6, C7
+Wed 23 Sep	C8, C9
+Thu 24 Sep	C10, then a full dry run from a fresh clone
+Fri 25 Sep	buffer and demo
+7. The ten commits
+
+Commit 1 is the baseline implementation and is the first repo milestone to be delivered. It establishes the repository scaffold, freezes the contracts, and brings up the PostgreSQL, Qdrant, and Redis infrastructure with the initial database schemas.
+
+Commit 1: Scaffold, contracts, infrastructure
+chore: scaffold repo, freeze contracts, bring up postgres/qdrant/redis with schemas
+
+Goal: everything later commits depend on. After this commit the three tracks can diverge. Relies on: nothing.
+
+Track A: Ingestion & Persistence
+
+git init, and a .gitignore covering .env, __pycache__/, *.pyc, .venv/, incoming/* and reports/*.
+Add .githooks/pre-commit, which rejects a staged .env or anything matching AKIA[0-9A-Z]{16} or aws_secret. Enable it with git config core.hooksPath .githooks.
+.env.example with every variable from §3.8 and placeholder values.
+db/00_schemas.sql creates the schemas audit, erp and langgraph.
+db/10_audit_schema.sql holds the adapted DDL from §3.4. Include file_events.
+db/erp_schema.sql is the provided file. If you don't have it yet, write db/dev/erp_standin.sql with the four ERP tables, 3 vendors, 4 POs and 6 SKUs, clearly labelled dev-only. Design them to enable the test scenarios in C4.
+compose.yaml with infrastructure only:
+one user-defined bridge network invoice-net
+postgres:16 with the init scripts mounted read-only into /docker-entrypoint-initdb.d/ (00_, 10_, and erp_schema.sql as 20_), the named volume pgdata, and env_file: .env
+Postgres healthcheck pg_isready -h 127.0.0.1 -U $${POSTGRES_USER} -d $${POSTGRES_DB}. Use TCP (-h 127.0.0.1), because during init the temporary server listens only on the Unix socket and would report a false "ready".
+qdrant/qdrant pinned to an explicit tag, with volume qdrant_data:/qdrant/storage
+a Qdrant healthcheck. Check which tools the image contains (docker compose exec qdrant sh -c 'command -v curl wget bash'). If none is present, use a bash -c '</dev/tcp/127.0.0.1/6333' TCP check.
+redis:7 with command redis-server --save "" --appendonly no, healthcheck redis-cli ping, and no volume
+published ports 5432, 6333, 6379 and restart unless-stopped
+agent/settings.py reads env and raises one clear error naming any missing variable.
+agent/db.py provides get_conn(), plus claim_invoice(file_path, name, type, checksum) -> invoice_id | None using INSERT … ON CONFLICT (file_checksum) DO NOTHING RETURNING invoice_id.
+Track B: FastAPI & Streamlit
+
+mock-erp/: main.py with GET /health and GET /vendor/{vendor_id}, models.py (Pydantic, per §3.3), db.py (connection-per-request psycopg, with startup retry), and requirements.txt. Run it natively on port 8001 against the composed Postgres.
+streamlit-ui/app.py: connect to PostgreSQL and show an "Invoices" table from audit.invoice_audit. Show a friendly empty state when there are no rows, and a sidebar "Database: connected" indicator. Native run only.
+Track C: Agents & RAG
+
+agent/state.py exactly as §3.1.
+agent/configs/rules.yaml complete per §3.9.
+agent/configs/persona.yaml with placeholder keys: system_common, detect_language, translate, repair_fields, vendor_adjudicate, report_narrative, rag_system, rag_reflect.
+agent/graph.py builds the final topology with no-op nodes: monitor → extract → translate → parse → validate_internal → validate_erp → report → index → END, plus an error edge to END.
+agent/main.py provides /health with dependency probes for PostgreSQL, Redis and Qdrant. On startup it retries about 5 times, then exits with code 1 and one clear log line. This is the "fail clearly, not broken" requirement.
+Acceptance
+
+docker compose up -d postgres qdrant redis, then docker compose ps shows all three healthy.
+docker compose exec postgres psql -U $POSTGRES_USER -d $POSTGRES_DB -c '\dn' lists audit, erp and langgraph. SELECT count(*) FROM erp.vendors is above 0.
+curl localhost:8001/vendor/<id> returns JSON.
+Stop Postgres, start the agent natively, and it exits non-zero with a readable message.
+Staging a file that contains AKIAABCDEFGHIJKLMNOP is blocked by the hook.
+Commit 2: Intake, complete ERP service, LLM wrapper
+feat: file monitor with checksum dedupe, full mock-erp API + container, Bedrock/Redis LLM wrapper
+
+Goal: files are detected and claimed exactly once. The ERP service is complete and containerised. Bedrock access is proven early. Relies on: C1 schema, state.py, settings.py, db.py.
+
+Track A: Ingestion & Persistence
+
+agents/monitor.py, a polling watcher thread. Every MONITOR_POLL_SECONDS it scans the top level of INCOMING_DIR and applies these rules:
+Ignore dotfiles and temp names (~$*, *.part, *.tmp, *.crdownload).
+Stability check: a file counts as ready only when its size and mtime are unchanged across two consecutive polls. This protects against half-copied files.
+Keep an in-memory (path, size, mtime) set so files are not re-hashed every poll.
+A file is handed to the graph only when it is stable.
+Monitor node in the graph:
+Map the extension to the type: .pdf, .docx, .png. Anything else logs a file_events row with unsupported and stops.
+Compute sha256 in 1 MB chunks.
+Call db.claim_invoice(...). A None result means duplicate: log an audit.file_events row with duplicate (with the earlier path in detail), then end. Otherwise write a detected event.
+If the file cannot be read or is 0 bytes, still record it: use sha256(path + "unreadable") as the synthetic checksum, set processing_status='error' with error_message, and log an error event.
+Output state: {file_path, file_checksum, file_type, invoice_id, thread_id=invoice_id}.
+db.py additions: log_file_event, set_status, mark_error. Node wrappers catch exceptions, call mark_error, and end the graph. A bad file must never kill the watcher.
+Track B: FastAPI & Streamlit
+
+mock-erp complete: GET /po/{po_number} (header plus line items ordered by line_number) and GET /sku/{sku_code}. Return 404 with {"detail": ...}. Add typed Pydantic responses, request logging to stdout (method path status ms, which is useful to show the HTTP boundary in the demo), and a /health that also checks the erp tables exist.
+mock-erp/Dockerfile and .dockerignore:
+pinned base python:3.11.<patch>-slim-<codename>
+copy requirements.txt and pip install --no-cache-dir before copying code
+create a non-root user (uid 10001) and USER app
+CMD uvicorn main:app --host 0.0.0.0 --port 8000
+a HEALTHCHECK using python -c "urllib.request…", since slim has no curl
+.dockerignore excludes .env, __pycache__/, *.pyc, .git/, .venv/, venv/
+Compose service mock-erp: build: ./mock-erp, image: invoice-mock-erp:1.0, ports 8001:8000, env_file: .env, environment POSTGRES_HOST=postgres, depends_on: postgres: condition: service_healthy, restart: on-failure:3.
+Follow brief §8.5: build it, check docker images size, run docker history --no-trunc, run it standalone, and confirm it serves before continuing.
+Streamlit "Inbox" tab: table of invoices (file name, type, status, detected time), an "Activity" expander from file_events (duplicates and unsupported files), and a refresh button. Native run.
+Track C: Agents & RAG
+
+cache.py: Redis get/set with TTL, wrapping every call in try/except so a Redis outage means "no cache".
+llm.py:
+chat(model_key, messages, temperature=0, json=False, cache=True) via litellm.completion (num_retries=3)
+embed(texts) via litellm.embedding
+cache key llm:{sha256(model + messages + temperature)}
+a tolerant JSON parser that strips ```json fences
+scripts/smoke_llm.py makes one call to each of the three models and one embedding. Run it today. Bedrock access and region problems are the largest external risk.
+graph.py: attach PostgresSaver using a psycopg_pool.ConnectionPool with kwargs={"autocommit": True, "row_factory": dict_row, "options": "-c search_path=langgraph"}, and call setup() at startup so checkpoints land in the langgraph schema.
+main.py lifespan: start the watcher plus one worker thread consuming a queue.Queue, which runs graph.invoke(input, {"configurable": {"thread_id": invoice_id}}). /health now also probes mock-erp/health.
+Acceptance
+
+Drop a PDF into incoming/. A row appears in audit.invoice_audit and a detected event in file_events.
+Copy the same file under a new name. A duplicate event is logged and no second invoice_audit row exists.
+A .txt file gives an unsupported event, and a 0-byte PDF gives an error row.
+docker compose up -d mock-erp reaches healthy. curl localhost:8001/po/<seed> returns the header plus lines.
+\dt langgraph.* shows the checkpoint tables.
+scripts/smoke_llm.py passes, or you know exactly which model access to fix.
+Commit 3: Extraction, agent and dashboard containers, internal validation
+feat: PDF/DOCX/PNG extraction with OCR fallback, agent + streamlit containers, invoice data validator
+
+Goal: raw text is stored for all three formats. All app images exist. The arithmetic rules are done and unit-tested. Relies on: C2 monitor state (invoice_id, file_path, file_type), rules.yaml.
+
+Track A: Ingestion & Persistence
+
+tools/extraction_tools.py:
+extract_pdf: use pdfplumber extract_text() per page. If the non-whitespace characters across all pages are below min_text_chars_per_page × pages, there is no usable text layer, so fall back to OCR with pdf2image.convert_from_path(dpi=300) and pytesseract.image_to_string(img, lang=OCR_LANGS) per page. Method is pdfplumber or tesseract.
+extract_docx: use Document.iter_inner_content() (python-docx 1.x) to keep paragraphs and tables in document order. Join table cells with | and include section headers, because invoice numbers often sit there. Method is docx.
+extract_image (PNG): open with Pillow, convert to grayscale, upscale if narrower than about 1,500 px, then run Tesseract with --psm 6. Method is tesseract.
+On startup, assert OCR_LANGS ⊆ pytesseract.get_languages(). If not, fail fast.
+agents/extractor.py is a node that dispatches by file_type. Store the text verbatim (only strip NUL bytes and normalise newlines). Persist raw_extracted_text and extraction_method through db.save_extraction, set status extracted, and use mark_error on failure.
+agent/Dockerfile and .dockerignore:
+pinned base, one apt-get install --no-install-recommends tesseract-ocr tesseract-ocr-eng tesseract-ocr-spa tesseract-ocr-deu tesseract-ocr-fra poppler-utils, followed by rm -rf /var/lib/apt/lists/* in the same layer
+determine the package list in a throwaway docker run -it python:… bash, not by repeated rebuilds
+then copy requirements.txt, pip install --no-cache-dir, then copy the code. This is the three-concern layer ordering from brief §8.
+non-root user, CMD uvicorn main:app --host 0.0.0.0 --port 8000, and a Python-based HEALTHCHECK
+The language packs must come from the real dataset, so open the sample invoices first.
+Compose service agent: build: ./agent, image: invoice-agent:1.0, ports 8000:8000, env_file, and hosts in environment. Volumes:
+./incoming:/data/incoming:ro
+reports_data:/data/reports (declare it top-level)
+./agent/configs:/app/configs:ro
+depends_on with condition: service_healthy for postgres, redis, qdrant and mock-erp
+Track B: FastAPI & Streamlit
+
+streamlit-ui/Dockerfile and .dockerignore: slim pinned base, deps before code, non-root user with a writable HOME, CMD streamlit run app.py --server.address=0.0.0.0 --server.port=8501 --server.headless=true --browser.gatherUsageStats=false, and a healthcheck on /_stcore/health. It must bind to 0.0.0.0.
+Compose service streamlit-ui: ports 8501:8501, env_file, POSTGRES_HOST=postgres, AGENT_URL=http://agent:8000, depends on postgres healthy and agent healthy.
+Dashboard "Invoice detail" tab: pick an invoice, then show the file facts (name, type, status, extraction method) and the raw extracted text (read-only) with a character count.
+Track C: Agents & RAG
+
+agents/invoice_validator.py provides validate_invoice(invoice, line_items, rules). All math uses Decimal.
+Required fields: every field in rules.required_fields must be present, otherwise add it to missing_fields with a high-severity discrepancy.
+Line totals: quantity × unit_price must equal line_total within line_total_tolerance_abs.
+Subtotal: Σ line_total must equal subtotal if present.
+Tax: expected_tax = subtotal × rate/100, with the rate taken from tax.rate_pct_by_currency or the default. Compare it to tax_amount within tax.tolerance_abs.
+Total: subtotal + tax_amount must equal total_amount. If tax is absent, compare Σ line_total to total_amount.
+The result is {validation_status, discrepancies[], missing_fields[]}. Status is partial when missing data blocked some checks, failed when any discrepancy exists, and passed otherwise. Severity comes from severity.* thresholds.
+LLM repair (single attempt): if required fields are missing, call Nova Lite with the persona prompt repair_fields to return JSON, then re-run the checks. Accept a repaired value only if its text literally appears in the source text. This is a guard against hallucination.
+tests/test_invoice_validator.py (pytest) covers: a clean pass, 10 × 50 with a stated total of 600 (high), a line-sum mismatch, wrong tax, a missing field, and 0.005 rounding edge cases.
+Acceptance
+
+Drop one PDF (text), one scanned PDF, one DOCX and one PNG. Each shows extracted text in the dashboard, with the right extraction_method.
+A non-English scan OCRs correctly (this proves the language packs).
+docker build of the agent produces an image under about 1.5 GB (docker images), and docker history --no-trunc invoice-agent:1.0 shows no secrets.
+docker compose up -d --build reaches all-healthy (postgres, qdrant, redis, mock-erp, agent, streamlit-ui).
+pytest agent/tests is green.
+Commit 4: Translation, parsing into typed rows, business validation
+feat: language detection + Bedrock translation with Redis cache, typed parsing, ERP business validator
+
+Goal: English text and structured rows are in PostgreSQL. The ERP comparison logic exists and is unit-tested against every discrepancy scenario. Relies on: C3 extraction, llm.py, cache.py, mock-erp endpoints.
+
+Track A: Ingestion & Persistence
+
+agents/translator.py:
+Detect: send the first 1,500 characters to Nova Lite with the detect_language prompt, expecting {language: ISO-639-1, confidence}. Cache under lang:{sha256}.
+English: translated_text = raw_extracted_text, and confidence is the detection confidence.
+Non-English: call Command R+ with the translate prompt ("translate to English, do not alter numbers, dates, currency symbols, codes or line breaks"). Ask for output wrapped in <translation>…</translation><confidence>0.93</confidence> and parse it with a regex. This is more robust than JSON-escaping a long text.
+Long text is split at paragraph boundaries (about 6,000 characters), and the confidence is the minimum across chunks. Confidence is self-reported by the model, and the report should say so.
+Cache under translation:{sha256(source_text)} with a TTL, and check the cache before calling Bedrock.
+Persist with db.save_translation(source_language, translated_text, translation_confidence).
+extractor.parse_fields(translated_text, source_language) -> (invoice, line_items) is deterministic (regex), with label synonyms taken from rules.parsing.labels:
+to_decimal() strips currency symbols and codes and thousands separators, and handles decimal commas (1.234,56) using source_language (de/es/fr).
+The currency is an ISO code if one is printed. Otherwise map from the symbol, and leave $ explicit-only, because it is ambiguous.
+Dates use rules.parsing.date_order and are normalised to ISO.
+Line items are parsed from row patterns, or from | rows for DOCX tables. Unmatched lines are ignored, and leftover fields such as a VAT id go into extras.
+First task: open every distinct invoice template in the dataset and write parser fixtures for each.
+db.save_parsed(invoice_id, invoice, line_items) runs one transaction that fills the typed columns and extracted_raw, then deletes and re-inserts invoice_line_items for that invoice. It is idempotent.
+Track B: FastAPI & Streamlit
+
+Author the test invoices under samples/ so they match your ERP data (adapt to the real ERP rows). Cover these scenarios:
+clean pass
+unit price within tolerance (for example 500 vs 480, 4.17%, passes)
+unit price beyond tolerance (8.2%)
+quantity off by one
+currency mismatch
+unknown PO
+unknown SKU
+arithmetic error
+Spanish, German and French variants, plus DOCX and PNG variants of a few
+Include a samples/README.md with the expected outcome of each file.
+mock-erp/tests/test_api.py (FastAPI TestClient) checks the contract and 404 shapes.
+Dashboard "Invoice detail" additions: source language and a coloured translation-confidence badge, raw and translated text side by side, a read-only header-fields panel, and a line-items table (join of invoice_line_items).
+Track C: Agents & RAG
+
+tools/erp_tools.py: ErpClient(base_url) using httpx.Client(timeout=5). get_po, get_vendor and get_sku return None on 404, and raise ErpUnavailable on 5xx or connection errors. It retries 2 times on connection errors and parses with parse_float=Decimal.
+agents/business_validator.py:
+If po_number is missing, add a high-severity po_number discrepancy and stop. If the PO returns 404, add a high-severity po_number "not found" discrepancy.
+Vendor: take vendor_id from the PO header and call get_vendor. Normalise both names (casefold, strip punctuation and legal suffixes such as ltd, inc, gmbh, sa) and compare with difflib.SequenceMatcher. A ratio at or above accept is a match, and at or below reject is a discrepancy. In between, ask Nova Lite for a yes/no with the vendor_adjudicate prompt (cached).
+Currency: compare with the PO currency (exact).
+Lines: match each invoice line to a PO line by item_code == sku (case-insensitive), falling back to line_number. An unmatched line is a high-severity item_code discrepancy. A get_sku 404 is also an item_code discrepancy.
+Quantity and price: deviation_pct = abs(inv - po) / po × 100. Record a discrepancy only when it exceeds quantity_tolerance_pct or unit_price_tolerance_pct. If the PO value is 0, record it with deviation_pct = null.
+One discrepancy per mismatched field (per line, with line_number), source='erp', severity from rules.severity.
+tests/test_business_validator.py uses httpx.MockTransport (no extra library) for all scenarios, including the tolerance edges: exactly 5% passes and 5.01% fails.
+Wire translate and parse into graph.py (replacing the no-ops).
+Acceptance
+
+A Spanish invoice ends with a populated translated_text, source_language='es', and a confidence in the 0 to 1 range.
+Reprocess the same text (delete the audit row, re-drop the file). Logs show cache hit and no Bedrock call.
+SELECT * FROM audit.invoice_line_items WHERE invoice_id=… returns one row per line, and typed columns match the sample.
+All business-validator scenario tests pass.
+docker compose up -d --build is still all-healthy.
+Commit 5: Validation wiring, reporting, end-to-end pipeline (Check 2)
+feat: wire validators, JSON/HTML reports, recommendation, persist to PostgreSQL + reports volume
+
+Goal: the complete non-RAG pipeline works inside containers, so Verification Check 2 passes. Relies on: C3 and C4 validators, C1 schema.
+
+Track A: Ingestion & Persistence
+
+db.save_validation(invoice_id, run, source, discrepancies) inserts discrepancy rows and sets validation_run.
+db.save_report(invoice_id, report_json, report_html, recommendation, validation_status) stores the outcome and marks processing_status='completed'.
+Write report files to /data/reports/<invoice_id>.json and .html atomically (write a temp file, then os.replace). The database remains the system of record and the files are a convenience.
+Every node step is one transaction. A re-run of any node is idempotent.
+Track B: FastAPI & Streamlit
+
+Dashboard Discrepancy viewer: a table with a severity icon (🔴 high, 🟠 medium, 🟡 low), field, "Invoice value", "ERP / Expected value", and deviation %. Above it, a plain-language banner such as "Needs review: 2 issues found".
+Report viewer: render report_html with st.components.v1.html, plus st.download_button for JSON and HTML.
+scripts/check_boundary.sh greps agent/ for SQL touching erp. and fails if it finds any. This enforces the service boundary the brief asks for.
+The ERP request log (added in C2) makes the boundary visible: docker compose logs mock-erp should show the agent's GET calls.
+Track C: Agents & RAG
+
+agents/reporter.py builds the report from the state:
+invoice summary, validation_status, recommendation
+discrepancy_summary (counts by severity and source, plus the items)
+missing_fields[]
+translation_summary (language, confidence, translated yes/no)
+generated_at
+Narrative: Nova Lite writes 3 to 5 sentences from the structured JSON only (persona prompt report_narrative, temperature 0, cached, instructed to use only facts in the JSON). If the LLM fails, use a deterministic template sentence so reports never block.
+Recommendation is a config-driven rule (optional per the brief). It gives approve when clean, reject when high-severity count ≥ reject_if_high_count_gte or the PO is not found, and review otherwise.
+HTML report is built with str.format and html.escape, with inline CSS and a printable layout. No template library.
+Final graph: monitor → extract → translate → parse → validate_internal → validate_erp → report → END. Any node exception routes to handle_error, which calls mark_error and ends.
+Combine both validators' statuses into validation_status (failed if either failed, partial if either partial).
+Acceptance (Check 2)
+
+Drop the PDF, DOCX and PNG samples (at least one non-English). Within about a minute each has processing_status='completed', a validation_status, discrepancy rows with the expected deviations, and report_json and report_html in PostgreSQL.
+docker compose exec agent ls /data/reports shows the files.
+The dashboard shows the discrepancies and the report.
+docker compose logs mock-erp shows GET /po/..., GET /vendor/..., GET /sku/....
+The 8.2% price sample has deviation_pct = 8.2000 and severity medium.
+scripts/check_boundary.sh passes.
+Commit 6: RAG indexing, retrieval and augmentation
+feat: chunk/embed/index to Qdrant from PostgreSQL, filtered retrieval, heuristic reranking, index stats
+
+Goal: everything about the vector index is derived from PostgreSQL and can be rebuilt without OCR. Retrieval and context assembly work. Relies on: C5 (report stored in PostgreSQL), C2 llm.py.
+
+Track A: Ingestion & Persistence
+
+tools/embedding_tools.py: chunk_text(text, size=900, overlap=120) breaks on paragraph boundaries. embed(texts) uses llm.embed (Titan takes one input per call, so loop; cache by sha256 under the llm: namespace).
+agents/indexer.py:
+ensure_collection() is idempotent and runs at startup. It creates invoices_rag (cosine, size EMBED_DIM) and the four keyword payload indexes.
+index_invoice(invoice_id) reads only from PostgreSQL, so live indexing and rebuild use the same code. Sources are the raw text (source_type='invoice', language source_language), the translated text (source_type='invoice', language en, skipped if identical to raw), and the report text (source_type='report', language en, derived by report_to_text(report_json)).
+Delete existing points for that invoice_id by filter first, then upsert with deterministic ids (§3.5). Set indexed_at.
+reindex_all() loops over completed invoices. Expose it as python -m agents.indexer --rebuild and as POST /admin/reindex.
+Add the index node to the graph after report.
+Track B: FastAPI & Streamlit
+
+Agent API: POST /query with the final QueryRequest and QueryResponse Pydantic models from §3.7 (fields already present, some empty for now), and GET /index/stats (points by source_type, indexed vs total invoices).
+Dashboard "Ask" tab v0: a question box, an optional invoice selector (scopes the search to one invoice), a debug expander listing retrieved chunks with scores, and "Indexed: n of m invoices" in the sidebar. It calls the agent using AGENT_URL.
+Track C: Agents & RAG
+
+agents/rag/retrieval.py:
+retrieve(question, invoice_id=None, vendor=None, source_types=None, k=8) embeds the question (cached) and runs a Qdrant filtered search (must conditions). It returns text, invoice_id, source_type and score.
+resolve_invoice_ref(question) finds invoice-number-like tokens in the question and resolves them to an invoice_id with a parameterised SQL lookup. That way "Why was invoice INV123 rejected?" filters to the right invoice without UI scoping.
+agents/rag/augmentation.py, augment(question, chunks, max_chars):
+drop chunks below min_score
+dedupe by normalised text
+heuristic rerank: final = score, plus a boost for source_type='report' when the question contains why, reject, flag, discrepancy or fail, plus a boost when the invoice number in the question matches the payload
+group by invoice
+assemble labelled blocks such as [report | INV123 | ABC Ltd], truncated to the character budget
+Unit tests for the chunker and the rerank pure functions.
+Acceptance
+
+After processing the samples, curl localhost:6333/collections/invoices_rag shows points greater than 0, and payloads contain all five required fields.
+POST /query with an invoice_id returns only that invoice's chunks.
+Delete the collection, then run python -m agents.indexer --rebuild. The point count is restored, and the logs show no extraction or OCR calls.
+The dashboard shows retrieved chunks and index stats.
+Commit 7: RAG generation, reflection loop, SQL fast path
+feat: query router (SQL vs RAG), Command R+ generation, RAG-triad reflection with retries
+
+Goal: natural-language questions work end to end. Structured questions never touch the vector store. Relies on: C6 retrieval and augmentation, C2 llm.py.
+
+Track A: Ingestion & Persistence
+
+agents/rag/sql_answers.py: a fixed set of parameterised, read-only SQL templates, run in a READ ONLY transaction with a statement_timeout. User text is never interpolated. Templates:
+invoice_total(invoice_ref)
+invoice_status(invoice_ref)
+discrepancies_for(invoice_ref)
+count_by_status()
+invoices_by_vendor(vendor)
+rejected_in_month(vendor?, month)
+sum_by_vendor(vendor)
+Slot extraction is deterministic. Invoice refs use the C6 resolver, vendors are matched against SELECT DISTINCT vendor_name, and month names are parsed with a small map.
+agents/rag/router.py: if the question matches a structured intent and all required slots resolve, use SQL. Otherwise use RAG. Return mode in the response.
+Track B: FastAPI & Streamlit
+
+Finalise POST /query to fill every field (answer, mode, sources, scores, attempts, low_confidence). Return a plain-language 503 message when Bedrock is unavailable, not a stack trace.
+Dashboard "Ask" tab, final version:
+a chat-style box with st.chat_input, and a few clickable sample questions
+a badge showing "Answered from the database" or "Answered from documents"
+a confidence indicator built from the average score
+a sources expander
+a visible warning when low_confidence is true
+a 60-second request timeout
+Track C: Agents & RAG
+
+agents/rag/generation.py: Command R+ via LiteLLM with the rag_system prompt ("answer only from the context, cite [invoice_id/source_type], say the records don't contain it if the context is insufficient"), temperature 0, cached in Redis.
+agents/rag/reflection.py: Nova Lite acts as judge, returning strict JSON {relevance, groundedness, context_relevance}, each 0 to 1. The average is computed in code, not by the LLM. The answer passes if avg > RAG_PASS_THRESHOLD (strictly greater: exactly 0.7 fails). The judge model differs from the generator, which reduces self-preference bias.
+agents/rag/rag_graph.py is a second StateGraph: route → sql | retrieve → augment → generate → reflect → (pass → END | fail and retries < 3 → retrieve | fail and retries = 3 → END). Retry policy:
+attempt 1: k=6
+attempt 2: k=10 and append the invoice number and "discrepancy report" to the query
+attempt 3: k=14 and drop soft filters
+Keep the best-scoring attempt and set low_confidence=true if none passed.
+Tests use a fake LLM (inject via module-level callable): average and threshold logic (0.7 exact, 0.71), and the retry loop stops after exactly 3 retries.
+Acceptance
+
+"Why was invoice <id> rejected?" returns mode: rag, an answer citing the report, and scores with an average above 0.7.
+"What is the total amount of invoice <id>?" returns mode: sql, matches the database value, and the logs show zero embedding or LLM calls.
+A forced-failing judge yields exactly 3 retries, then a low-confidence answer with the best attempt.
+An identical repeat question is served from the Redis LLM cache (visibly faster, with a cache hit log line).
+Commit 8: Human-in-the-loop (feedback, correction, optional re-validation)
+feat: insert-only human feedback with DB-level guard, correction UI, optional re-validation
+
+Goal: an auditor can correct values without destroying the original extraction. The brief requires this to be "stored permanently rather than overwriting the original". Relies on: C5 persistence, C6 indexer.
+
+Track A: Ingestion & Persistence
+
+db.save_feedback(invoice_id, field_name, original_value, corrected_value, corrected_by) is INSERT only.
+Field naming convention: header fields use the column name (total_amount). Line fields use line_items[<line_number>].<column> (for example line_items[2].unit_price).
+db.get_effective_invoice(invoice_id) returns the invoice and line items with the latest feedback per field overlaid (DISTINCT ON (field_name) … ORDER BY corrected_at DESC, id DESC). Original rows are never modified.
+Add a small plpgsql trigger on audit.human_feedback that raises an exception on DELETE, and on UPDATE of any column other than revalidated. Enforcement at the database level is easy to demonstrate. Because init scripts run only on a fresh volume, recreate the dev volume after adding it.
+Track B: FastAPI & Streamlit
+
+POST /feedback on the agent. It validates that the invoice exists, checks field_name against an allow-list, coerces numeric and date values (returning 422 with a friendly message), then inserts. GET /invoices/{id}/effective returns the overlaid view, so overlay logic lives in one place.
+Dashboard "Review & correct" tab:
+a form (st.form) with the header fields and st.data_editor for line items
+a "Your name" input (corrected_by)
+a computed change preview ("Unit price: 500 → 480") before submitting
+a history table of past corrections (who, when, what, re-validated ✓)
+a Re-validate button that calls /revalidate/{id} and shows "Re-validation isn't enabled" gracefully on 501
+Track C: Agents & RAG (optional per the brief; this is the cut line)
+
+POST /revalidate/{invoice_id} returns 202 and runs a short graph in the worker thread: validate_internal(effective values) → validate_erp → report → reindex report chunks only. It increments validation_run, writes new discrepancy rows (old runs stay as history), updates validation_status and recommendation (derived state, not the extracted values), and sets human_feedback.revalidated=true for the consumed rows.
+If you cut it: return 501 from that route and spend the time on error-path hardening instead: Bedrock credentials removed (the invoice ends in error, not stuck), a corrupted PDF, an oversized file, ERP down mid-run.
+Acceptance
+
+In the UI, change a unit price from 500 to 480. A human_feedback row exists with original_value='500' and corrected_value='480'.
+invoice_line_items.unit_price is still 500 (the original is intact).
+UPDATE audit.human_feedback SET corrected_value='1' fails with the trigger message.
+If re-validation is implemented: after clicking Re-validate, the run-2 discrepancy list no longer has the price mismatch, the report changed, revalidated=true, and a RAG question about the flag reflects run 2.
+Commit 9: Containerization hardening and persistence proof (Checks 1, 3, 4, 5, 6)
+chore: harden Dockerfiles and compose, fail-fast startup, scripted persistence and secrets checks
+
+Goal: the stack is production-shaped, not just running. This commit targets the marks the brief weights most heavily (containerization 15%, persistence and security evidence). Relies on: everything from C1 to C8.
+
+Track A: Ingestion & Persistence (data plane)
+
+Compose review:
+pgdata and qdrant_data are declared at top level and mounted at each service's data directory
+Redis has no volume
+init scripts are mounted so erp_schema.sql loads on first start with no manual step
+Verify each healthcheck is honest: stop a service, and docker compose ps must flip to unhealthy within the interval.
+scripts/counts.sh prints SELECT count(*) for the audit tables and the Qdrant points count.
+scripts/check_persistence.sh does the following:
+seed and count
+docker compose down then up -d
+counts are equal and a RAG question still answers
+docker compose down -v then up -d
+counts are zero
+Check 4 caveat: incoming/ is a host bind mount and survives down -v. After up, the monitor would re-ingest the files and refill the audit trail, hiding the data loss. The script and the runbook must move the invoices out of incoming/ before down -v, show the empty tables, then drop a file back in to show fresh processing.
+Track B: FastAPI & Streamlit (service plane)
+
+Audit all three Dockerfiles against brief §8.1:
+explicit pinned tags (invoice-agent:1.0, invoice-mock-erp:1.0, invoice-ui:1.0)
+dependencies installed before code
+.dockerignore excludes at least .env, __pycache__/, *.pyc, .git/, .venv/
+non-root user (verify with docker compose exec <svc> id)
+no --reload, and logs go to stdout and stderr only
+Compose: depends_on uses condition: service_healthy everywhere (streamlit waits for agent, agent waits for mock-erp, postgres, qdrant and redis). Set start_period on the agent healthcheck, restart: unless-stopped for the stateful services and on-failure:3 for the apps. All service-to-service addressing is by name (no IPs, no localhost).
+docker compose config shows no secrets inlined.
+Track C: Agents & RAG (agent runtime)
+
+Fail-fast startup verifies PostgreSQL, Redis, Qdrant and mock-erp /health, the Tesseract language packs, and that model env vars are set (without making a live Bedrock call). It retries a bounded number of times, then exits with code 1 and one clear log line.
+Graceful shutdown: on SIGTERM the watcher stops, the worker finishes the current invoice, and the container sets stop_grace_period.
+Logging: standard logging to stdout, level from LOG_LEVEL, with invoice_id in each pipeline log line.
+Pin every dependency with ==, run pip check during the build, and confirm the agent image stays under about 1.5 GB (docker system df).
+scripts/check_no_secrets.sh <image> runs docker history --no-trunc and greps for keys, plus git grep on the working tree. scripts/check_dns.sh runs docker compose exec agent getent hosts postgres qdrant redis mock-erp.
+Acceptance
+
+docker compose down -v && docker compose up --build -d && docker compose ps shows all six healthy with no manual steps (Check 1).
+Check 3 passes: audit rows and Qdrant points identical before and after down/up, and the RAG interface answers without reprocessing (monitor logs "duplicate skipped").
+Check 4 passes: counts are zero after down -v. You can explain that -v removes named volumes.
+scripts/check_no_secrets.sh is clean for all three images (Check 5).
+check_dns.sh resolves every name (Check 6).
+Stop postgres, then up -d agent. The agent waits, or exits with the clear message. It never sits half-started.
+Commit 10: Verification demo, documentation, slides, release
+docs: full verification script, README, architecture diagram, slides outline, agile evidence, v1.0.0
+
+Goal: the deliverable list from brief §12 is complete and a stranger can run it. Relies on: C1 to C9.
+
+Track A: Ingestion & Persistence
+
+scripts/verify_all.sh runs the six checks in order with PASS/FAIL output and a printed prompt for the explanation each check requires (for example which flag caused the difference in Check 4).
+Finalise samples/ with at least 10 files: EN/ES/DE (and FR if in the dataset), PDF/DOCX/PNG, one duplicate, one unsupported, one corrupt. Document expected results in samples/README.md.
+Clean-checkout dry run: git clone into a temp directory, copy only your own .env, run the three-command start, then verify_all.sh. Also run git log -p | grep -E 'AKIA|aws_secret', which must return nothing. Confirm .env is not tracked.
+Track B: FastAPI & Streamlit
+
+UI polish for a non-technical auditor:
+plain labels and consistent status wording (passed shows ✅ "Passed", failed shows ⚠️ "Issues found", partial shows ❓ "Incomplete")
+help text, empty states and friendly errors (st.error, never a stack trace)
+a page title and consistent layout
+docs/DEMO.md: the click path and timing for the live demo.
+Take the screenshots used in the slides.
+Track C: Agents & RAG
+
+README: prerequisites, how to create .env from .env.example, the start command (docker compose up --build -d), URLs and ports, troubleshooting with the §8.6 diagnostic commands, the service-address table, the data-placement table, how to change rules.yaml, and how to rebuild Qdrant.
+Architecture diagram (the one required diagram): six containers on one bridge network, ports, arrows for HTTP, SQL and vector traffic, and the volumes. Draw it in Mermaid and export an image.
+Slides (max 5):
+problem and solution
+architecture diagram
+data placement and persistence (Checks 3 and 4)
+the three flows: ingestion, RAG (SQL vs RAG, reflection loop) and human-in-the-loop
+verification results, lessons learned and agile process
+Prompt and persona files: finalise persona.yaml (no placeholders) and document each prompt.
+docs/VIVA.md: the explanations in §9.
+Agile evidence (10%): CHANGELOG.md mapping each commit to the increment it delivered, a board screenshot (issues per track per commit), a short retrospective, and the tags v0.1 to v1.0.
+Package for submission with git archive, which excludes .env by construction.
+Acceptance
+
+Fresh clone, then .env, then docker compose up --build -d. All six services are healthy.
+verify_all.sh passes all six checks in under about 10 minutes.
+The deliverables list is complete: three Dockerfiles, three .dockerignore files, compose.yaml, the audit schema, the README, the demo, at most 5 slides with the diagram, and the prompt and persona files. No credentials anywhere.
+8. Cut line (if time runs short, drop in this order)
+Re-validation (C8 Track C), a route stub returning 501 is fine.
+Vendor-name LLM adjudication (fall back to difflib thresholds only).
+LLM field repair (C3 Track C).
+LLM narrative in reports (keep the template sentence).
+Recommendation rule (leave the column NULL).
+Never cut: named volumes, health-gated depends_on, the ERP HTTP boundary, insert-only feedback, raw text retention, and the six verification checks.
+
+9. Viva cheat-sheet (the brief says to be prepared to explain these)
+Scaling: mock-erp and streamlit-ui are stateless and scale horizontally. The agent can scale workers too, because ON CONFLICT (file_checksum) makes claiming a file atomic. PostgreSQL and Qdrant are stateful single nodes here and scale vertically, or with replication and clustering. Redis is a disposable cache.
+LiteLLM in-process vs gateway: in-process is simpler and has no extra hop. In production a gateway centralises rate limits, cost tracking and credentials.
+Restart policy: it recovers a crashed process but does not fix a bad start order, since it just loops. Ordering is fixed by health-gated depends_on.
+Volumes vs object storage: a bind-mounted incoming/ is a development convenience. Production would use object storage with events, and the database would keep only the reference.
+down vs down -v: -v deletes named volumes (pgdata, qdrant_data, reports_data). Without it, the data survives.
+Why Redis holds nothing durable: if it is flushed the system only gets slower (translations and LLM answers are recomputed).
+Why audit is separate from langgraph: checkpoints are working memory for resuming workflows, and they can be pruned. The audit trail is the business record.
+Why SQL for structured questions: it is exact, cheap and needs no LLM. RAG is reserved for open-ended "why" questions.
