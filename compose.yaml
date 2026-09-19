@@ -77,9 +77,63 @@ services:
     networks:
       - invoice-net
 
+  agent:
+    build:
+      context: ./agent
+    image: invoice-agent:1.0
+    container_name: invoice-agent
+    env_file:
+      - .env
+    environment:
+      POSTGRES_HOST: postgres
+      REDIS_HOST: redis
+      QDRANT_HOST: qdrant
+      ERP_BASE_URL: http://mock-erp:8000
+      AGENT_URL: http://agent:8000
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+      mock-erp:
+        condition: service_started
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./incoming:/data/incoming:ro
+      - reports_data:/data/reports
+      - ./agent/configs:/app/configs:ro
+    restart: unless-stopped
+    networks:
+      - invoice-net
+
+  streamlit-ui:
+    build:
+      context: ./streamlit-ui
+    image: invoice-streamlit:1.0
+    container_name: invoice-streamlit
+    env_file:
+      - .env
+    environment:
+      POSTGRES_HOST: postgres
+      AGENT_URL: http://agent:8000
+    depends_on:
+      postgres:
+        condition: service_healthy
+      agent:
+        condition: service_started
+    ports:
+      - "8501:8501"
+    restart: unless-stopped
+    networks:
+      - invoice-net
+
 volumes:
   pgdata:
   qdrant_data:
+  reports_data:
 
 networks:
   invoice-net:
