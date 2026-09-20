@@ -3,6 +3,68 @@ from __future__ import annotations
 from decimal import Decimal, InvalidOperation
 
 
+FIELD_ALIASES = {
+    "invoice_no": "invoice_number",
+    "invoice_num": "invoice_number",
+    "invoice_id": "invoice_number",
+    "vendor_id": "vendor_name",
+    "vendor": "vendor_name",
+    "total": "total_amount",
+    "total_due": "total_amount",
+    "gross_total": "total_amount",
+    "sku": "item_code",
+    "item_no": "item_code",
+    "line_item_total": "line_total",
+}
+
+
+def _flatten_required_fields(required_fields):
+    if isinstance(required_fields, dict):
+        flattened = []
+        for value in required_fields.values():
+            if isinstance(value, (list, tuple, set)):
+                flattened.extend(value)
+            elif isinstance(value, str):
+                flattened.append(value)
+        return flattened
+    if isinstance(required_fields, (list, tuple, set)):
+        return list(required_fields)
+    if required_fields is None:
+        return []
+    return [required_fields]
+
+
+def _split_required_fields(rules: dict) -> tuple[list[str], list[str]]:
+    required_fields = rules.get("required_fields", [])
+    if isinstance(required_fields, dict):
+        header_fields = _flatten_required_fields(required_fields.get("header", []) or required_fields.get("invoice", []) or [])
+        line_fields = _flatten_required_fields(required_fields.get("line_item", []) or required_fields.get("items", []) or [])
+        return header_fields, line_fields
+    return _flatten_required_fields(required_fields), []
+
+
+def _canonicalize_invoice(invoice: dict) -> dict:
+    canonical = dict(invoice or {})
+    for alias, target in FIELD_ALIASES.items():
+        if alias in canonical and target not in canonical:
+            canonical[target] = canonical[alias]
+    return canonical
+
+
+def _canonicalize_line_items(line_items: list[dict]) -> list[dict]:
+    canonical_items = []
+    for line in (line_items or []):
+        if not isinstance(line, dict):
+            canonical_items.append(line)
+            continue
+        normalized = dict(line)
+        for alias, target in FIELD_ALIASES.items():
+            if alias in normalized and target not in normalized:
+                normalized[target] = normalized[alias]
+        canonical_items.append(normalized)
+    return canonical_items
+
+
 def to_decimal(value):
     if value is None:
         return None
@@ -33,12 +95,15 @@ def _severity_for_deviation(deviation_pct, rules):
 
 
 def validate_invoice(invoice: dict, line_items: list[dict], rules: dict) -> dict:
+    invoice = _canonicalize_invoice(invoice)
+    line_items = _canonicalize_line_items(line_items)
     discrepancies: list[dict] = []
     missing_fields: list[str] = []
-    required_fields = rules.get("required_fields", [])
+    required_fields, line_required_fields = _split_required_fields(rules)
 
     for field in required_fields:
-        value = invoice.get(field)
+        canonical_field = FIELD_ALIASES.get(field, field)
+        value = invoice.get(field) if field in invoice else invoice.get(canonical_field)
         if value in (None, ""):
             missing_fields.append(field)
             discrepancies.append({
@@ -51,6 +116,24 @@ def validate_invoice(invoice: dict, line_items: list[dict], rules: dict) -> dict
                 "severity": rules.get("severity", {}).get("missing_field", "high"),
                 "message": f"Missing required field: {field}",
             })
+
+    for field in line_required_fields:
+        for line in line_items:
+            canonical_field = FIELD_ALIASES.get(field, field)
+            value = line.get(field) if field in line else line.get(canonical_field)
+            if value in (None, ""):
+                missing_fields.append(field)
+                discrepancies.append({
+                    "source": "internal",
+                    "line_number": line.get("line_number"),
+                    "field_name": field,
+                    "invoice_value": None,
+                    "expected_value": "required",
+                    "deviation_pct": None,
+                    "severity": rules.get("severity", {}).get("missing_field", "high"),
+                    "message": f"Missing required field: {field} on line {line.get('line_number')}",
+                })
+                break
 
     if "subtotal" not in invoice or invoice.get("subtotal") in (None, ""):
         if invoice.get("total_amount") is not None or invoice.get("tax_amount") is not None or line_items:

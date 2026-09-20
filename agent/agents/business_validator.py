@@ -38,7 +38,29 @@ def _severity_for_deviation(deviation_pct: Decimal | None, severity_map: dict, d
     return "low"
 
 
+def _canonical_invoice(invoice: dict) -> dict:
+    if not isinstance(invoice, dict):
+        return {}
+    normalized = dict(invoice)
+    aliases = {
+        "invoice_no": "invoice_number",
+        "invoice_num": "invoice_number",
+        "vendor_id": "vendor_name",
+        "vendor": "vendor_name",
+        "total": "total_amount",
+        "total_due": "total_amount",
+        "gross_total": "total_amount",
+        "sku": "item_code",
+        "item_no": "item_code",
+    }
+    for alias, target in aliases.items():
+        if alias in normalized and target not in normalized:
+            normalized[target] = normalized[alias]
+    return normalized
+
+
 def business_validate(invoice: dict, line_items: list[dict], rules: dict, erp_client) -> dict:
+    invoice = _canonical_invoice(invoice)
     discrepancies: list[dict] = []
     po_number = invoice.get("po_number")
     if not po_number:

@@ -5,7 +5,10 @@ from agent.tools.erp_tools import ErpClient
 
 
 RULES = {
-    "required_fields": ["invoice_number", "invoice_date", "vendor_name", "currency", "total_amount"],
+    "required_fields": {
+        "header": ["invoice_no", "invoice_date", "vendor_id", "currency", "total_amount"],
+        "line_item": ["item_code", "quantity", "unit_price"],
+    },
     "erp": {
         "unit_price_tolerance_pct": Decimal("5"),
         "quantity_tolerance_pct": Decimal("0"),

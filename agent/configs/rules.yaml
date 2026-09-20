@@ -1,9 +1,15 @@
 required_fields:
-  - invoice_number
-  - invoice_date
-  - vendor_name
-  - currency
-  - total_amount
+  header:
+    - invoice_no
+    - invoice_date
+    - vendor_id
+    - currency
+    - total_amount
+  line_item:
+    - item_code
+    - quantity
+    - unit_price
+    - line_total
 
 extraction:
   min_text_chars_per_page: 40
